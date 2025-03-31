@@ -20,8 +20,8 @@ type ExtensionManager struct {
 	loaded     map[string]bool      // tracks successfully loaded extensions for precise shutdown/rollback.
 }
 
-// NewExtensionManager creates and initializes a new ExtensionManager.
-func NewExtensionManager() *ExtensionManager {
+// New creates and initializes a new ExtensionManager.
+func New() *ExtensionManager {
 	// Uses the globally configured zerolog/log logger. Ensure it's configured before use.
 	return &ExtensionManager{
 		extensions: make(map[string]Extension),
