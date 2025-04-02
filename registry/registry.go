@@ -1,6 +1,6 @@
 // Package depreg provides a simple type-based dependency registry
 // to decouple modules relying on shared global state.
-package depreg
+package registry
 
 import (
 	"errors"
