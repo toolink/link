@@ -46,7 +46,7 @@ end
 
 // Locker represents a distributed lock for a specific resource key.
 type Locker struct {
-	client     *redis.Client
+	client     redis.Cmdable
 	key        string        // The resource key to lock in Redis.
 	value      string        // A unique value for this lock instance (set on successful lock).
 	ttl        time.Duration // Time-to-live for the lock.
@@ -95,10 +95,10 @@ func WithMaxRetries(retries int) Option {
 }
 
 // NewLocker creates a new Locker instance.
-// client: An initialized go-redis client.
+// client: An initialized go-redis client interface.
 // key: The identifier for the resource to be locked.
 // options: Optional configuration functions (e.g., WithTTL, WithRetryDelay, WithMaxRetries).
-func NewLocker(client *redis.Client, key string, options ...Option) (*Locker, error) {
+func NewLocker(client redis.Cmdable, key string, options ...Option) (*Locker, error) {
 	l := &Locker{
 		client:     client,
 		key:        key,

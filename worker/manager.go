@@ -113,11 +113,7 @@ func (cm *ConsumerManager) Subscribe(topic string, handler any, opts ...Subscrip
 	cm.wg.Add(1) // Add to the main manager WG for the subscriber's primary poller loop
 	go sub.run()
 
-	log.Info().Str("topic", topic).
-		Str("mode", fmt.Sprintf("%v", cfg.mode)).
-		Int("concurrency", cfg.concurrency).
-		Dur("block_time_ms", cfg.blockTime).
-		Msg("subscriber started polling list")
+	log.Info().Str("topic", topic).Str("mode", fmt.Sprintf("%v", cfg.mode)).Int("concurrency", cfg.concurrency).Dur("block_time", cfg.blockTime).Msg("subscriber started polling list")
 
 	return sub, nil
 }

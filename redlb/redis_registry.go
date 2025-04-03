@@ -15,7 +15,7 @@ import (
 
 type redisRegistry struct {
 	opts    *Options
-	client  *redis.Client
+	client  redis.Cmdable
 	mu      sync.Mutex               // Protects stopChs map
 	stopChs map[string]chan struct{} // Map instance key -> stop channel for keepalive
 	// wg for managing watcher goroutines started by this registry instance (if any global ones exist)
@@ -37,12 +37,7 @@ func NewRedisRegistry(opts ...Option) (Registry, error) {
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
 
-	log.Info().
-		Str("prefix", options.KeyPrefix).
-		Dur("ttl", options.TTL).
-		Dur("heartbeat", options.HeartbeatInterval).
-		Dur("watch_interval", options.WatchInterval).
-		Msg("redis registry initialized")
+	log.Info().Str("prefix", options.KeyPrefix).Dur("ttl", options.TTL).Dur("heartbeat", options.HeartbeatInterval).Dur("watch_interval", options.WatchInterval).Msg("redis registry initialized")
 
 	return &redisRegistry{
 		opts:    options,

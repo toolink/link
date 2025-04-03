@@ -10,7 +10,7 @@ import (
 // Options holds configuration for the registry.
 type Options struct {
 	// Redis client instance (required).
-	Client *redis.Client
+	Client redis.Cmdable
 	// Prefix for all keys stored in Redis (default: "redlb:svc").
 	KeyPrefix string
 	// Time-to-live for registered service instances (default: 30s).
@@ -72,7 +72,7 @@ func newOptions(opts ...Option) *Options {
 }
 
 // WithRedisClient sets the Redis client.
-func WithRedisClient(client *redis.Client) Option {
+func WithRedisClient(client redis.Cmdable) Option {
 	return func(o *Options) {
 		o.Client = client
 	}
