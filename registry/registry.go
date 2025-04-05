@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -281,4 +282,23 @@ func (r *DependencyRegistry) findDependencyByType(targetType reflect.Type) (depe
 	// 3. Not Found
 	log.Debug().Str("type", targetType.String()).Msg("Dependency not found")
 	return dependencyHolder{}, ErrDependencyNotFound
+}
+
+// defaultRegistry is a global instance of DependencyRegistry.
+func defaultRegistry() *atomic.Value {
+	v := &atomic.Value{}
+	v.Store(New())
+	return v
+}
+
+var globalRegistry = defaultRegistry()
+
+// SetRegistry sets the global registry instance.
+func SetRegistry(r *DependencyRegistry) {
+	globalRegistry.Store(r)
+}
+
+// GetRegistry returns the global registry instance.
+func GetRegistry() *DependencyRegistry {
+	return globalRegistry.Load().(*DependencyRegistry)
 }
