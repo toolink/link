@@ -74,6 +74,5 @@ func (s *redisStore) Allow(ctx context.Context, key string, rate float64, period
 	} else {
 		log.Warn().Str("key", key).Bool("allowed", false).Msg("redis rate limit exceeded")
 	}
-
 	return allowed, nil
 }
