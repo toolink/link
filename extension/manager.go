@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -282,22 +281,4 @@ func (m *ExtensionManager) GetExtension(name string) (Extension, bool) {
 	defer m.mu.RUnlock() // ensure lock is released
 	ext, exists := m.extensions[name]
 	return ext, exists
-}
-
-func defaultManager() *atomic.Value {
-	v := &atomic.Value{}
-	v.Store(New())
-	return v
-}
-
-var globalManager = defaultManager()
-
-// SetManager sets the global extension manager.
-func SetManager(m *ExtensionManager) {
-	globalManager.Store(m)
-}
-
-// GetManager retrieves the current global extension manager.
-func GetManager() *ExtensionManager {
-	return globalManager.Load().(*ExtensionManager)
 }
