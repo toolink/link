@@ -1,78 +1,52 @@
 package pubsub
 
-import "time"
-
-// --- Subscription Options ---
-
-type subscriptionConfig struct {
-	concurrency     int           // Max concurrent workers for function subs (1 for channel/sequential func)
-	bufferSize      int           // Size of the subscription's internal message buffer
-	dispatchTimeout time.Duration // How long the topic dispatcher waits for subscription buffer
+// SubscriptionOptions holds configuration for a subscription.
+type SubscriptionOptions struct {
+	// Concurrency specifies the maximum number of concurrent handler executions.
+	// Only applicable when the handler is a function.
+	// Defaults to 1.
+	Concurrency int
+	// MaxQueueSize specifies the maximum number of messages to queue for Redis list subscriptions
+	// before Publish starts failing. Only applicable for Redis implementation.
+	// Defaults to 0 (no limit).
+	MaxQueueSize int64
+	// Redis specific options might go here in the future,
+	// e.g., block timeout for BRPOP.
+	// RedisBlockTimeout time.Duration
 }
 
-// SubscriptionOption configures a Subscription.
-type SubscriptionOption func(*subscriptionConfig)
+// Option is a function type used to configure subscriptions.
+type Option func(*SubscriptionOptions)
 
-var defaultSubscriptionConfig = subscriptionConfig{
-	concurrency:     1,
-	bufferSize:      128,             // Sensible default buffer per subscription
-	dispatchTimeout: 1 * time.Second, // Avoid blocking dispatcher for too long
+// DefaultSubscriptionOptions returns the default options.
+func DefaultSubscriptionOptions() *SubscriptionOptions {
+	return &SubscriptionOptions{
+		Concurrency:  1,
+		MaxQueueSize: 0, // 0 means no limit by default
+	}
 }
 
-// WithConcurrency sets the number of concurrent workers for function subscriptions.
-// Must be 1 for channel subscriptions. Use value > 1 for concurrent function execution.
-// Default is 1.
-func WithConcurrency(n int) SubscriptionOption {
-	return func(cfg *subscriptionConfig) {
+// WithConcurrency sets the concurrency level for function handlers.
+func WithConcurrency(n int) Option {
+	return func(o *SubscriptionOptions) {
 		if n > 0 {
-			cfg.concurrency = n
-		} else {
-			// Log perhaps? Reset to 1?
-			cfg.concurrency = 1
+			o.Concurrency = n
 		}
 	}
 }
 
-// WithBufferSize sets the buffer size for the subscription's internal channel.
-// Default is 128.
-func WithBufferSize(size int) SubscriptionOption {
-	return func(cfg *subscriptionConfig) {
-		if size > 0 {
-			cfg.bufferSize = size
+// WithMaxQueueSize sets the maximum queue size for Redis list subscriptions.
+func WithMaxQueueSize(size int64) Option {
+	return func(o *SubscriptionOptions) {
+		if size >= 0 { // Allow 0 for no limit
+			o.MaxQueueSize = size
 		}
 	}
 }
 
-// WithDispatchTimeout sets how long the topic dispatcher will wait (per message)
-// for a subscription's internal buffer to accept the message before potentially
-// logging a warning and moving on. Default is 1 second.
-func WithDispatchTimeout(timeout time.Duration) SubscriptionOption {
-	return func(cfg *subscriptionConfig) {
-		if timeout > 0 {
-			cfg.dispatchTimeout = timeout
-		}
-	}
-}
-
-// --- Broker Options ---
-
-type brokerConfig struct {
-	topicBufferSize int // Default buffer size for new topic channels
-}
-
-// BrokerOption configures a Broker.
-type BrokerOption func(*brokerConfig)
-
-var defaultBrokerConfig = brokerConfig{
-	topicBufferSize: 256, // Default buffer for the main channel of each topic
-}
-
-// WithTopicBufferSize sets the buffer size for newly created topic channels.
-// Default is 256.
-func WithTopicBufferSize(size int) BrokerOption {
-	return func(cfg *brokerConfig) {
-		if size > 0 {
-			cfg.topicBufferSize = size
-		}
+// Apply applies the options to the SubscriptionOptions struct.
+func (o *SubscriptionOptions) Apply(opts ...Option) {
+	for _, opt := range opts {
+		opt(o)
 	}
 }

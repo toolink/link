@@ -8,7 +8,12 @@ import (
 
 func defaultBroker() *atomic.Value {
 	v := &atomic.Value{}
-	v.Store(pubsub.New())
+	// Initialize with default (memory) broker. Panic on error.
+	broker, err := pubsub.New()
+	if err != nil {
+		panic("failed to initialize default global pubsub broker: " + err.Error())
+	}
+	v.Store(broker)
 	return v
 }
 

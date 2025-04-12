@@ -1,245 +1,325 @@
 package pubsub
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"reflect"
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
-type subscriptionType int
-
-const (
-	channelSubscription subscriptionType = iota
-	functionSubscription
+var (
+	errInvalidHandler     = errors.New("pubsub: handler must be a function or a channel")
+	errHandlerArgs        = errors.New("pubsub: handler function signature mismatch")
+	errChanTypeMismatch   = errors.New("pubsub: channel type mismatch")
+	errSendToClosedChan   = errors.New("pubsub: attempt to send on closed channel")
+	errSubscriptionClosed = errors.New("pubsub: subscription is closed")
 )
 
-// messagePayload represents the data passed through the system.
-type messagePayload []any
+// handlerType identifies the type of the subscription handler.
+type handlerType int
 
-// subscription represents a consumer attached to a topic.
-type subscription struct {
-	id            string
-	topicName     string
-	subType       subscriptionType
-	config        subscriptionConfig
-	handlerFunc   reflect.Value         // For function subscriptions
-	handlerType   reflect.Type          // For validating function args
-	consumeChan   chan<- messagePayload // For channel subscriptions (owned by user)
-	internalChan  chan messagePayload   // Internal buffer queue fed by topic dispatcher
-	stopOnce      sync.Once
-	stopChan      chan struct{}   // Signals workers to stop
-	workerWg      sync.WaitGroup  // Tracks this subscription's workers
-	brokerWg      *sync.WaitGroup // Broker's WaitGroup for shutdown coordination
-	topicStopChan <-chan struct{} // To know if the parent topic is stopping
+const (
+	handlerTypeInvalid handlerType = iota
+	handlerTypeFunc
+	handlerTypeChan
+)
+
+// Subscription represents a single subscription to a topic.
+type Subscription struct {
+	ID      string
+	Topic   string
+	options *SubscriptionOptions
+	mu      sync.RWMutex
+	closed  bool
+
+	// Handler specific fields
+	handlerType handlerType
+	handlerFunc reflect.Value  // For function handlers
+	handlerArgs []reflect.Type // Expected argument types for function handlers
+	handlerChan reflect.Value  // For channel handlers
+	chanType    reflect.Type   // Type of the channel element
+
+	// For function handlers with concurrency > 1
+	deliveryQueue chan []*Message    // Queue for messages to be processed by handler funcs
+	wg            sync.WaitGroup     // Waits for handler goroutines to finish
+	cancel        context.CancelFunc // To stop handler goroutines
 }
 
-// newSubscription creates a common subscription base.
-func newSubscription(topicName string, topicStopChan <-chan struct{}, brokerWg *sync.WaitGroup, opts ...SubscriptionOption) *subscription {
-	cfg := defaultSubscriptionConfig
-	for _, opt := range opts {
-		opt(&cfg)
+// newSubscription creates a new subscription instance.
+// It validates the handler and prepares it for message delivery.
+func newSubscription(topic string, handler any, opts ...Option) (*Subscription, error) {
+	options := DefaultSubscriptionOptions()
+	options.Apply(opts...)
+
+	s := &Subscription{
+		ID:      uuid.NewString(),
+		Topic:   topic,
+		options: options,
 	}
 
-	// Ensure channel subscriptions always have concurrency 1 internally
-	// The user controls concurrency by how they read from the channel.
-	// if subType == channelSubscription {
-	//  cfg.concurrency = 1 // This logic needs to move to where type is known
-	// }
+	handlerVal := reflect.ValueOf(handler)
+	handlerTyp := handlerVal.Type()
 
-	return &subscription{
-		id:            uuid.NewString(),
-		topicName:     topicName,
-		config:        cfg,                                       // Apply options first
-		internalChan:  make(chan messagePayload, cfg.bufferSize), // Use configured buffer size
-		stopChan:      make(chan struct{}),
-		brokerWg:      brokerWg,
-		topicStopChan: topicStopChan,
+	switch handlerTyp.Kind() {
+	case reflect.Func:
+		s.handlerType = handlerTypeFunc
+		s.handlerFunc = handlerVal
+		// Store argument types for validation during publish
+		s.handlerArgs = make([]reflect.Type, handlerTyp.NumIn())
+		for i := 0; i < handlerTyp.NumIn(); i++ {
+			s.handlerArgs[i] = handlerTyp.In(i)
+		}
+		// Validate return types (optional, could enforce none)
+
+		// If concurrency is needed, set up the delivery queue and workers
+		if options.Concurrency > 1 {
+			ctx, cancel := context.WithCancel(context.Background()) // Use background context for workers
+			s.cancel = cancel
+			s.deliveryQueue = make(chan []*Message, options.Concurrency*2) // Buffer size heuristic
+			s.wg.Add(options.Concurrency)
+			for i := 0; i < options.Concurrency; i++ {
+				go s.runWorker(ctx)
+			}
+		}
+
+	case reflect.Chan:
+		if handlerTyp.ChanDir()&reflect.SendDir == 0 {
+			return nil, errors.New("pubsub: channel must be sendable (chan<- T or chan T)")
+		}
+		s.handlerType = handlerTypeChan
+		s.handlerChan = handlerVal
+		s.chanType = handlerTyp.Elem() // Store element type T for chan T
+
+	default:
+		return nil, errInvalidHandler
 	}
+
+	return s, nil
 }
 
-// start launches the worker goroutine(s) for the subscription.
-func (s *subscription) start() {
-	// Channel subscriptions effectively have 1 worker pushing to the user channel.
-	// Function subscriptions use configured concurrency.
-	numWorkers := 1
-	if s.subType == functionSubscription {
-		numWorkers = s.config.concurrency
-	}
-
-	s.workerWg.Add(numWorkers)
-	s.brokerWg.Add(numWorkers) // Add to broker's WG for overall shutdown
-
-	l := log.With().
-		Str("subscription_id", s.id).
-		Str("topic", s.topicName).
-		Str("type", s.subType.String()).
-		Int("workers", numWorkers).
-		Int("buffer", s.config.bufferSize).
-		Logger()
-
-	l.Debug().Msg("starting subscription workers")
-
-	for i := 0; i < numWorkers; i++ {
-		go s.runWorker(i, l)
-	}
-}
-
-// runWorker is the main loop for a single worker goroutine.
-func (s *subscription) runWorker(workerID int, l zerolog.Logger) {
-	defer func() {
-		s.workerWg.Done()
-		s.brokerWg.Done() // Decrement broker's WG when worker exits
-	}()
-
-	workerLogger := l.With().Int("worker_id", workerID).Logger()
-	workerLogger.Debug().Msg("subscription worker started")
-
+// runWorker processes messages from the delivery queue for concurrent function handlers.
+func (s *Subscription) runWorker(ctx context.Context) {
+	defer s.wg.Done()
 	for {
 		select {
-		case <-s.stopChan:
-			workerLogger.Debug().Msg("subscription worker stopping via stopChan")
+		case <-ctx.Done():
+			log.Debug().Str("subscription_id", s.ID).Str("topic", s.Topic).Msg("worker shutting down")
+			// Drain remaining messages? Or rely on Close to handle this?
+			// For now, just exit. Messages published after Close starts might be lost.
 			return
-		case <-s.topicStopChan:
-			workerLogger.Debug().Msg("subscription worker stopping via topicStopChan")
-			return
-		case msg, ok := <-s.internalChan:
-			if !ok {
-				workerLogger.Debug().Msg("subscription worker stopping because internalChan closed")
-				return // Channel closed
+		case msgs := <-s.deliveryQueue:
+			if msgs == nil { // Channel closed signal
+				continue
 			}
-			s.processMessage(msg, workerLogger)
+			s.invokeFuncHandler(msgs)
 		}
 	}
 }
 
-// processMessage handles a single message according to the subscription type.
-func (s *subscription) processMessage(msg messagePayload, l zerolog.Logger) {
-	l.Debug().Int("msg_args", len(msg)).Msg("worker processing message")
-	switch s.subType {
-	case channelSubscription:
-		// Send to the user-provided channel.
-		// If the user channel blocks, this worker blocks.
-		// Use a select with stopChan/topicStopChan to allow cancellation.
-		select {
-		case s.consumeChan <- msg:
-			// Message sent successfully to user channel
-		case <-s.stopChan:
-			l.Warn().Msg("dropping message: subscription stopping during send to user channel")
-		case <-s.topicStopChan:
-			l.Warn().Msg("dropping message: topic stopping during send to user channel")
-		}
-
-	case functionSubscription:
-		s.callHandlerFunc(msg, l)
+// deliver sends messages to the subscription's handler.
+// It handles both channel and function handlers, including concurrency.
+func (s *Subscription) deliver(ctx context.Context, messages []*Message, try bool) error {
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return errSubscriptionClosed
 	}
-}
+	htype := s.handlerType
+	s.mu.RUnlock() // Unlock before potentially blocking operations
 
-// callHandlerFunc executes the registered function using reflection.
-func (s *subscription) callHandlerFunc(payload messagePayload, l zerolog.Logger) {
-	numArgs := s.handlerType.NumIn()
-	if len(payload) != numArgs {
-		l.Error().
-			Int("expected_args", numArgs).
-			Int("received_args", len(payload)).
-			Interface("payload_preview", payload). // Log part of payload for debug
-			Msg("argument count mismatch for handler function. Skipping.")
-		return
-	}
-
-	callArgs := make([]reflect.Value, numArgs)
-	for i := 0; i < numArgs; i++ {
-		argType := s.handlerType.In(i)
-		providedVal := reflect.ValueOf(payload[i]) // payload[i] is 'any'
-
-		// Check for nil and target type compatibility
-		if payload[i] == nil {
-			// Can we assign nil to the target type? (Interface, Ptr, Slice, Map, Chan, Func)
-			kind := argType.Kind()
-			if kind == reflect.Interface || kind == reflect.Ptr || kind == reflect.Slice ||
-				kind == reflect.Map || kind == reflect.Chan || kind == reflect.Func {
-				callArgs[i] = reflect.Zero(argType) // Use Zero value for nil-able types
-			} else {
-				l.Error().
-					Int("arg_index", i).
-					Str("expected_type", argType.String()).
-					Msg("argument type mismatch: cannot assign nil to non-nilable type. Skipping.")
-				return
+	switch htype {
+	case handlerTypeFunc:
+		if s.options.Concurrency > 1 {
+			// Use delivery queue for concurrent execution
+			select {
+			case s.deliveryQueue <- messages:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				if try {
+					log.Warn().Str("subscription_id", s.ID).Str("topic", s.Topic).Msg("delivery queue full, dropping message (tryPublish)")
+					return nil // Ignore error for TryPublish
+				}
+				// Block until space is available or context is canceled
+				select {
+				case s.deliveryQueue <- messages:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
-		} else if !providedVal.Type().AssignableTo(argType) {
-			// Check if types are assignable (covers basic types, interfaces, etc.)
-			l.Error().
-				Int("arg_index", i).
-				Str("expected_type", argType.String()).
-				Str("received_type", providedVal.Type().String()).
-				Msg("argument type mismatch for handler function. Skipping.")
-			return
 		} else {
-			callArgs[i] = providedVal
+			// Direct invocation for non-concurrent function
+			return s.invokeFuncHandler(messages)
+		}
+	case handlerTypeChan:
+		return s.sendToChanHandler(ctx, messages, try)
+	default:
+		// Should not happen
+		return errInvalidHandler
+	}
+}
+
+// invokeFuncHandler calls the function handler with the given messages.
+// It performs reflection-based argument matching.
+func (s *Subscription) invokeFuncHandler(messages []*Message) error {
+	s.mu.RLock() // Lock needed to access handlerFunc and handlerArgs safely
+	fn := s.handlerFunc
+	expectedArgs := s.handlerArgs
+	s.mu.RUnlock()
+
+	if fn.IsZero() {
+		return errSubscriptionClosed // Handler cleared during close
+	}
+
+	// Check if the number of arguments matches
+	if len(expectedArgs) != len(messages) {
+		log.Error().Str("subscription_id", s.ID).Str("topic", s.Topic).Int("expected", len(expectedArgs)).Int("got", len(messages)).Msg("handler argument count mismatch")
+		return errHandlerArgs
+	}
+
+	// Prepare arguments for the function call
+	callArgs := make([]reflect.Value, len(messages))
+	for i, msg := range messages {
+		if msg == nil || msg.Payload == nil {
+			// Handle nil message/payload - pass zero value of expected type
+			callArgs[i] = reflect.Zero(expectedArgs[i])
+			continue
+		}
+
+		payloadVal := reflect.ValueOf(msg.Payload)
+		if !payloadVal.Type().AssignableTo(expectedArgs[i]) {
+			log.Error().Str("subscription_id", s.ID).Str("topic", s.Topic).Int("arg_index", i).Str("expected", expectedArgs[i].String()).Str("got", payloadVal.Type().String()).Msg("handler argument type mismatch")
+			return errHandlerArgs
+		}
+		callArgs[i] = payloadVal
+	}
+
+	// Call the function
+	// We might want to run this in a separate goroutine with recovery
+	// but for simplicity now, call directly. Concurrency handled by runWorker.
+	fn.Call(callArgs)
+	return nil
+}
+
+// sendToChanHandler sends messages to the channel handler.
+// It handles different channel element types (any or specific type).
+func (s *Subscription) sendToChanHandler(ctx context.Context, messages []*Message, try bool) error {
+	s.mu.RLock() // Lock needed to access handlerChan safely
+	ch := s.handlerChan
+	chType := s.chanType
+	s.mu.RUnlock()
+
+	if ch.IsZero() {
+		return errSubscriptionClosed // Channel cleared during close
+	}
+
+	// Determine the value to send based on channel type
+	var valueToSend reflect.Value
+	if chType.Kind() == reflect.Interface && chType.NumMethod() == 0 { // Check if it's 'any' (interface{})
+		// If channel is chan any or chan *Message, send the first message
+		// Note: Sending multiple messages to a single chan element doesn't make sense.
+		// We'll send the first message only. Consider logging a warning if len(messages) > 1?
+		if len(messages) > 0 {
+			valueToSend = reflect.ValueOf(messages[0]) // Send *Message
+		} else {
+			return nil // No messages to send
+		}
+	} else {
+		// Channel expects a specific type T (chan T)
+		if len(messages) != 1 {
+			log.Warn().Str("subscription_id", s.ID).Str("topic", s.Topic).Int("num_messages", len(messages)).Msg("sending multiple messages to a typed channel (chan T) is ambiguous; sending only the first message's payload")
+		}
+		if len(messages) == 0 {
+			return nil // No messages to send
+		}
+		payloadVal := reflect.ValueOf(messages[0].Payload)
+		if !payloadVal.Type().AssignableTo(chType) {
+			log.Error().Str("subscription_id", s.ID).Str("topic", s.Topic).Str("expected", chType.String()).Str("got", payloadVal.Type().String()).Msg("channel type mismatch")
+			return errChanTypeMismatch
+		}
+		valueToSend = payloadVal
+	}
+
+	if try {
+		// Non-blocking send for TryPublish
+		if ch.TrySend(valueToSend) {
+			return nil
+		} else {
+			// TrySend failed (channel full or closed)
+			// Check if closed
+			// Note: Detecting closed channel reliably without select is hard.
+			// TrySend returning false could mean full or closed. Assume full for TryPublish.
+			log.Warn().Str("subscription_id", s.ID).Str("topic", s.Topic).Msg("channel full or closed, dropping message (tryPublish)")
+			return nil // Ignore error for TryPublish
+		}
+	} else {
+		// Blocking send for Publish using reflect.Select
+		ctxDoneCase := reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(ctx.Done()),
+		}
+		sendCase := reflect.SelectCase{
+			Dir:  reflect.SelectSend,
+			Chan: ch,
+			Send: valueToSend,
+		}
+
+		chosen, _, recvOK := reflect.Select([]reflect.SelectCase{ctxDoneCase, sendCase})
+		_ = recvOK // Explicitly use recvOK to avoid unused variable error
+		switch chosen {
+		case 0: // ctx.Done()
+			// The context was canceled. The value received is zero, but recvOK is true if the channel wasn't closed.
+			// We only care that the context is done.
+			return ctx.Err()
+		case 1: // sendCase
+			// Message successfully sent
+			return nil
+		default:
+			// Should not happen with only two cases unless channel is closed concurrently?
+			// If the channel 'ch' is closed, SelectSend will be chosen, but the send will panic.
+			// We might need a recover mechanism around this Select or ensure Close handles this.
+			// For now, assume successful send if chosen == 1.
+			// If TrySend failed earlier because the channel was closed, we might reach here too.
+			// Let's return an error indicating potential closure.
+			log.Warn().Str("subscription_id", s.ID).Str("topic", s.Topic).Msg("select send case failed unexpectedly, channel might be closed")
+			return errSendToClosedChan // Or a more specific error
 		}
 	}
-
-	// Call the function with panic recovery
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				l.Error().Interface("panic_info", r).Msg("panic recovered during handler function execution")
-				// Maybe add stack trace here in real-world scenario
-			}
-		}()
-		l.Debug().Msg("calling handler function")
-		_ = s.handlerFunc.Call(callArgs) // Ignore return values
-		l.Debug().Msg("handler function call complete")
-	}()
 }
 
-// validateHandlerFunc checks if the provided function is valid.
-func validateHandlerFunc(handler any) (reflect.Value, reflect.Type, error) {
-	if handler == nil {
-		return reflect.Value{}, nil, fmt.Errorf("handler function cannot be nil")
+// Close cleans up the subscription resources.
+func (s *Subscription) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil // Already closed
 	}
-	handlerVal := reflect.ValueOf(handler)
-	handlerType := handlerVal.Type()
+	s.closed = true
 
-	if handlerType.Kind() != reflect.Func {
-		return reflect.Value{}, nil, fmt.Errorf("handler must be a function, got %s", handlerType.Kind())
+	// Stop concurrent workers if any
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.deliveryQueue != nil {
+		close(s.deliveryQueue) // Signal workers to stop processing new messages
 	}
 
-	if handlerType.NumOut() > 0 {
-		log.Warn().Str("func_type", handlerType.String()).Msg("handler function has return values, which will be ignored")
+	// Clear handler references to allow GC
+	s.handlerFunc = reflect.Value{}
+	s.handlerChan = reflect.Value{}
+
+	s.mu.Unlock() // Unlock before waiting
+
+	// Wait for workers to finish processing queued messages
+	if s.options.Concurrency > 1 {
+		s.wg.Wait()
 	}
 
-	return handlerVal, handlerType, nil
-}
-
-// stop signals the subscription workers to terminate and waits for them.
-func (s *subscription) stop() {
-	s.stopOnce.Do(func() {
-		l := log.With().Str("subscription_id", s.id).Str("topic", s.topicName).Logger()
-		l.Debug().Msg("stopping subscription")
-		close(s.stopChan)     // 1. Signal workers to stop reading internalChan
-		s.workerWg.Wait()     // 2. Wait for all workers to finish processing in-flight messages
-		close(s.internalChan) // 3. Close internal channel AFTER workers are done
-		l.Debug().Msg("subscription stopped")
-	})
-}
-
-// String representation for logging subscription type
-func (st subscriptionType) String() string {
-	switch st {
-	case channelSubscription:
-		return "channel"
-	case functionSubscription:
-		return "function"
-	default:
-		return "unknown"
-	}
-}
-
-// ID returns the unique identifier of the subscription.
-func (s *subscription) ID() string {
-	return s.id
+	log.Debug().Str("subscription_id", s.ID).Str("topic", s.Topic).Msg("subscription closed")
+	return nil
 }
